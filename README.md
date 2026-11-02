@@ -21,37 +21,37 @@ The development of this single-crate binary is divided into six logical implemen
 
 ### Phase 1: Tensor Core & Sequential Math
 
-* [ ] Implement a basic Tensor abstraction supporting 1D, 2D, and 3D shapes.
-* [ ] Write naive, single-threaded nested loop implementations for: 
+* [x] Implement a basic Tensor abstraction supporting 1D, 2D, and 3D shapes.
+* [x] Write naive, single-threaded nested loop implementations for: 
 
   * Matrix multiplication (MatMul)
   * Layer Normalization (LayerNorm / RMSNorm)
   * Element-wise operations (SiLU, GeLU, Add, Multiply)
-* [ ] Ensure memory layout is contiguous in a flat Vec<f32> to prevent layout divergence.
+* [x] Ensure memory layout is contiguous in a flat Vec<f32> to prevent layout divergence.
 
 ### Phase 2: The Transformer Architecture
 
-* [ ] Implement the multi-head attention mechanism.
-* [ ] Build a predictable, sequential Key-Value (KV) cache structure.
-* [ ] Write the feed-forward network forward pass.
-* [ ] Assemble the network layer cascade (iterating sequentially through layer blocks).
+* [x] Implement the multi-head attention mechanism.
+* [x] Build a predictable, sequential Key-Value (KV) cache structure.
+* [x] Write the feed-forward network forward pass.
+* [x] Assemble the network layer cascade (iterating sequentially through layer blocks).
 
 ### Phase 3: Deterministic Sampler Block
 
-* [ ] Integrate rand_chacha::ChaCha8Rng.
-* [ ] Implement sequential temperature scaling over logits.
-* [ ] Implement sequential Softmax normalization.
-* [ ] Implement the single-pass Cumulative Distribution Function (CDF) sampling algorithm.
+* [x] Integrate rand_chacha::ChaCha8Rng.
+* [x] Implement sequential temperature scaling over logits.
+* [x] Implement sequential Softmax normalization.
+* [x] Implement the single-pass Cumulative Distribution Function (CDF) sampling algorithm.
 
 ### Phase 4: Model Loading & GGUF/Safetensors Parsing
 
-* [ ] Create a parser to read model weights sequentially from disk.
-* [ ] Set up tokenization mapping using a simple byte-pair encoding (BPE) or unigram decoder.
+* [x] Create a parser to read model weights sequentially from disk.
+* [x] Set up tokenization mapping using a simple byte-pair encoding (BPE) or unigram decoder.
 
 ### Phase 5: Deterministic Storage Layer & WAL
 
-* [ ] Implement a binary Write-Ahead Log (WalWriter) that appends generated tokens sequentially alongside the internal PRNG state counter.
-* [ ] Build a semantic Checkpoint serialization system to capture minimal execution metadata: 
+* [x] Implement a binary Write-Ahead Log (WalWriter) that appends generated tokens sequentially alongside the internal PRNG state counter.
+* [x] Build a semantic Checkpoint serialization system to capture minimal execution metadata: 
 
 rust
 
@@ -62,12 +62,12 @@ pub struct DeferCheckpoint {
     pub history_tokens: Vec<u32>,
 }
 
-* [ ] Implement a Checkout Engine that takes a checkpoint file, validates the model weights, and deterministically reconstructs the exact historical KV cache state via fast-forward recomputation.
+* [x] Implement a Checkout Engine that takes a checkpoint file, validates the model weights, and deterministically reconstructs the exact historical KV cache state via fast-forward recomputation.
 
 ### Phase 6: Verification Suite
 
-* [ ] Create an automated integration test that runs inference 100 consecutive times on a fixed seed to verify zero string deviation.
-* [ ] Create a checkpoint checkout test confirming that a recomputed KV cache exactly matches a freshly evaluated prompt sequence down to the bit level.
+* [x] Create an automated integration test that runs inference 100 consecutive times on a fixed seed to verify zero string deviation.
+* [x] Create a checkpoint checkout test confirming that a recomputed KV cache exactly matches a freshly evaluated prompt sequence down to the bit level.
 
 ### Step-by-Step Implementation Guide
 
@@ -166,3 +166,59 @@ cargo run -- --model path/to/model.safetensors \
              --prompt "The alignment problem can be solved by" \
              --temperature 0.7 \
              --seed 42424242
+
+
+### Implementation Status
+
+All six phases are implemented. Module map:
+
+| Phase | Module | Contents |
+|---|---|---|
+| 1 | `src/tensor.rs`, `src/ops.rs` | Rank 1–3 `Tensor` over a flat `Vec<f32>`; sequential MatMul, linear, RMSNorm, LayerNorm, SiLU, GeLU, Add, Mul, softmax |
+| 2 | `src/model.rs` | Llama-family decoder (RMSNorm, RoPE, grouped-query attention, gated FFN, optional QKV bias), append-only `KvCache` |
+| 3 | `src/sampler.rs` | Temperature, softmax, single-pass CDF. Exactly one ChaCha8 word per sampled token, none for greedy. Ties go to the lowest index, NaN is treated as `-inf` |
+| 4 | `src/safetensors.rs`, `src/tokenizer.rs`, `src/json.rs` | Single-pass sequential safetensors reader (F32/F16/BF16/F64) that hashes the file (SHA-256 = model signature) while it reads; BPE tokenizer from `tokenizer.json` (byte-level and SentencePiece/byte-fallback), plus a raw-byte fallback |
+| 5 | `src/wal.rs`, `src/checkpoint.rs`, `src/engine.rs` | CRC-protected WAL that survives torn tails, `DeferCheckpoint` binary format, `Session::checkout` Checkout Engine |
+| 6 | `tests/verification.rs` | 100-run zero-deviation test; bit-level checkout-vs-fresh KV cache test; resume, WAL-crash and tamper tests |
+
+The only dependencies are `rand` and `rand_chacha`. JSON, SHA-256, CRC-32 and f16/bf16 conversion are implemented in-crate.
+
+#### Notes on the design
+
+* **One code path for prefill and decode.** Prompt tokens and generated tokens go through the same `Model::forward(token, cache)` call, one at a time. So a cache rebuilt from a checkpoint is produced by exactly the same sequence of float operations as the live cache, and is bit-identical to it.
+* **Verified checkout.** During fast-forward recomputation, the Checkout Engine re-samples every generated position and compares it with the recorded token. Any tampering or non-determinism is reported as `DeferError::Divergence`, so it never silently yields a different state. It also rejects checkpoints whose model signature does not match the loaded weights.
+* **`DeferCheckpoint` extra fields.** The checkpoint adds `prompt_len` and `rng_word_pos` to the fields in the spec above. `prompt_len` is needed to know which positions were sampled. `rng_word_pos` is redundant under the one-draw-per-token rule, and is kept as a cross-check.
+* **No reassociation.** Rust never enables fast-math or FP contraction, so the loop order in the source is the order that runs. `ops::linear` computes four *independent* output rows per pass for speed. Each row keeps a single in-order accumulator, and a unit test asserts the results are bit-identical to the naive loop.
+* **Greedy tie-breaking.** The `max_by` snippet in the guide above returns the *last* maximum on ties. `sampler::argmax` uses a strict `>` instead, so the lowest index wins, as constraint 4 requires.
+* **Scope of reproducibility.** Results are byte-identical across runs on the same binary and platform. `exp`, `sin` and `cos` come from the platform libm, so cross-platform bit-equality is not guaranteed.
+* **Tokenizer.** The byte-level pre-tokenizer approximates the GPT-2 split regex. On unusual inputs, token boundaries may differ from the reference HF tokenizer, but they are always deterministic.
+
+### Usage
+
+```bash
+# Build and run the test suite
+cargo test --release
+
+# Try it without downloading anything (random weights, byte tokenizer)
+cargo run --release -- make-test-model --out tiny.safetensors
+
+# Real model: a Llama-family safetensors file with config.json and tokenizer.json next to it
+# (e.g. HuggingFaceTB/SmolLM2-135M, TinyLlama, Qwen2.5)
+cargo run --release -- --model path/to/model.safetensors \
+             --prompt "The alignment problem can be solved by" \
+             --temperature 0.7 --seed 42424242 --max-tokens 64 \
+             --wal run.wal --checkpoint run.ckpt
+
+# Inspect a WAL or checkpoint
+cargo run --release -- inspect run.wal
+
+# Rebuild the exact state from a WAL/checkpoint, then keep generating (appends to the same WAL)
+cargo run --release -- checkout --model path/to/model.safetensors --from run.wal --wal run.wal --max-tokens 32
+
+# Self-check: N identical runs plus a bit-identical checkout
+cargo run --release -- verify --model path/to/model.safetensors --prompt "Hello" --runs 100
+```
+
+Run `defer --help` for every option (`--seed-hex`, `--durable` fsync-per-token WAL, `--no-bos`, `--ignore-eos`, `--tokenizer`, `--quiet`).
+
+The WAL and checkpoint binary layouts are documented at the top of `src/wal.rs` and `src/checkpoint.rs`.

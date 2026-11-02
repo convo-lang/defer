@@ -1,0 +1,25 @@
+[package]
+name = "defer"
+version = "0.1.0"
+edition = "2021"
+description = "A strictly deterministic, single-threaded LLM inference engine"
+license = "Apache-2.0"
+
+[lib]
+name = "defer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "defer"
+path = "src/main.rs"
+
+[dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
+
+[profile.release]
+# Rust never enables fast-math / FP contraction, so optimisations cannot
+# reassociate floating point reductions. These settings only make builds
+# themselves reproducible.
+codegen-units = 1
+debug = false
