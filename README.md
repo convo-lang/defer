@@ -4,6 +4,8 @@ A strictly deterministic, single-threaded LLM inference engine written in pure R
 
 Unlike standard inference engines that prioritize raw token throughput via highly parallelized, non-associative hardware operations, this engine prioritizes absolute reproducibility. Given the same input parameters, model weights, prompt, and PRNG seed, defer will always produce the exact same byte-for-byte token sequence. 
 
+By optimizing for 100% mathematical reproducibility, defer eliminates the need to save massive raw floating-point tensor matrices to disk for context caching. Instead, it relies on a compute-driven, ultra-lightweight Write-Ahead Log (WAL) to reconstruct identical context states on demand. 
+
 ### Core Architectural Constraints
 
 To maintain 100% determinism, the codebase must adhere to the following design constraints: 
@@ -15,7 +17,7 @@ To maintain 100% determinism, the codebase must adhere to the following design c
 
 ### Project Structure & Roadmap
 
-The development of this single-crate binary is divided into five logical implementation phases: 
+The development of this single-crate binary is divided into six logical implementation phases: 
 
 ### Phase 1: Tensor Core & Sequential Math
 
@@ -46,9 +48,26 @@ The development of this single-crate binary is divided into five logical impleme
 * [ ] Create a parser to read model weights sequentially from disk.
 * [ ] Set up tokenization mapping using a simple byte-pair encoding (BPE) or unigram decoder.
 
-### Phase 5: Verification Suite
+### Phase 5: Deterministic Storage Layer & WAL
+
+* [ ] Implement a binary Write-Ahead Log (WalWriter) that appends generated tokens sequentially alongside the internal PRNG state counter.
+* [ ] Build a semantic Checkpoint serialization system to capture minimal execution metadata: 
+
+rust
+
+pub struct DeferCheckpoint {
+    pub model_signature: [u8; 32],
+    pub base_seed: [u8; 32],
+    pub temperature: f32,
+    pub history_tokens: Vec<u32>,
+}
+
+* [ ] Implement a Checkout Engine that takes a checkpoint file, validates the model weights, and deterministically reconstructs the exact historical KV cache state via fast-forward recomputation.
+
+### Phase 6: Verification Suite
 
 * [ ] Create an automated integration test that runs inference 100 consecutive times on a fixed seed to verify zero string deviation.
+* [ ] Create a checkpoint checkout test confirming that a recomputed KV cache exactly matches a freshly evaluated prompt sequence down to the bit level.
 
 ### Step-by-Step Implementation Guide
 
@@ -101,7 +120,6 @@ pub fn sample_token(logits: &[f32], temperature: f32, rng: &mut ChaCha8Rng) -> u
 }
 
 
-
 ### 2. Ensuring Strict Order of Operations
 
 When computing matrix multiplications, avoid any compiler optimizations or auto-vectorization techniques that might split accumulators across unaligned boundaries if they alter evaluation order. Stick to explicit loop orders: 
@@ -121,7 +139,6 @@ pub fn matmul_sequential(out: &mut [f32], a: &[f32], b: &[f32], m: usize, n: usi
 }
 
 
-
 ### Getting Started
 
 ### Prerequisites
@@ -139,7 +156,6 @@ rand = "0.8"
 rand_chacha = "0.3"
 
 
-
 ### Running the Engine
 
 To execute text generation with a predictable outcome: 
@@ -150,4 +166,3 @@ cargo run -- --model path/to/model.safetensors \
              --prompt "The alignment problem can be solved by" \
              --temperature 0.7 \
              --seed 42424242
-
