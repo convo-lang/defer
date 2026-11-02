@@ -6,9 +6,10 @@
 //! has to replay `history` through the same code path to reproduce the
 //! cache bit-for-bit.
 
+use crate::attribution::{self, Explanation, PositionScore, ValueNorms};
 use crate::checkpoint::DeferCheckpoint;
 use crate::error::{DeferError, Result};
-use crate::model::{KvCache, Model};
+use crate::model::{AttnTrace, KvCache, Model};
 use crate::sampler::{sample_token, words_per_sample};
 use crate::sha256::to_hex;
 use rand::SeedableRng;
@@ -28,6 +29,15 @@ pub struct Session<'m> {
     history: Vec<u32>,
     prompt_len: usize,
     logits: Option<Vec<f32>>,
+    tracer: Option<Tracer>,
+}
+
+/// Live attribution state: the attention trace of the most recent query and
+/// the incrementally maintained value-norm cache.
+struct Tracer {
+    trace: AttnTrace,
+    valid: bool,
+    norms: ValueNorms,
 }
 
 impl<'m> Session<'m> {
@@ -44,6 +54,7 @@ impl<'m> Session<'m> {
             history: Vec::new(),
             prompt_len: 0,
             logits: None,
+            tracer: None,
         })
     }
 
@@ -59,8 +70,32 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Record attention traces so [`Session::step_explained`] is cheap.
+    /// Tracing only copies values out of the forward pass, so outputs and
+    /// the KV cache stay bit-identical to an untraced session.
+    pub fn enable_tracing(&mut self) {
+        if self.tracer.is_none() {
+            self.tracer = Some(Tracer {
+                trace: AttnTrace::default(),
+                valid: false,
+                norms: ValueNorms::new(self.model),
+            });
+        }
+    }
+
+    pub fn tracing(&self) -> bool {
+        self.tracer.is_some()
+    }
+
     fn feed(&mut self, token: u32) -> Result<()> {
-        let logits = self.model.forward(token, &mut self.cache)?;
+        let logits = match self.tracer.as_mut() {
+            Some(tr) => {
+                let l = self.model.forward_traced(token, &mut self.cache, &mut tr.trace)?;
+                tr.valid = true;
+                l
+            }
+            None => self.model.forward(token, &mut self.cache)?,
+        };
         self.history.push(token);
         self.logits = Some(logits);
         Ok(())
@@ -99,6 +134,65 @@ impl<'m> Session<'m> {
             }
         }
         Ok(out)
+    }
+
+    /// Attention × value attribution for the token about to be sampled,
+    /// over every position in the current history (in position order).
+    ///
+    /// If no trace is available (tracing enabled late), the last token is
+    /// recomputed with tracing on. Determinism makes that recomputation
+    /// bit-identical, so session state is unchanged.
+    pub fn explain_next(&mut self) -> Result<Vec<PositionScore>> {
+        let last = *self
+            .history
+            .last()
+            .ok_or_else(|| DeferError::Model("no context to explain".into()))?;
+        self.enable_tracing();
+        let tr = self.tracer.as_mut().unwrap();
+        if !tr.valid {
+            self.cache.truncate(self.history.len() - 1);
+            let logits = self.model.forward_traced(last, &mut self.cache, &mut tr.trace)?;
+            debug_assert!(self.logits.as_deref().map_or(true, |l| crate::ops::bit_eq(l, &logits)));
+            self.logits = Some(logits);
+            tr.valid = true;
+        }
+        tr.norms.sync(self.model, &self.cache);
+        Ok(attribution::attention_attribution(&tr.trace, &tr.norms, &self.history))
+    }
+
+    /// Sample the next token like [`Session::step`] and explain it with the
+    /// top `top_k` context positions. Consumes the PRNG exactly like `step`.
+    pub fn step_explained(&mut self, top_k: usize) -> Result<Explanation> {
+        let scores = self.explain_next()?;
+        let token = self.sample()?;
+        let logprob = attribution::log_softmax_at(self.logits.as_ref().unwrap(), token as usize);
+        let position = self.history.len();
+        self.feed(token)?;
+        Ok(Explanation { position, token, logprob, top: attribution::top_k(scores, top_k) })
+    }
+
+    /// [`Session::generate`] with a per-token [`Explanation`].
+    pub fn generate_explained(
+        &mut self,
+        max_tokens: usize,
+        stop: &[u32],
+        top_k: usize,
+        mut on_token: impl FnMut(&Session<'m>, &Explanation) -> Result<()>,
+    ) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        for _ in 0..max_tokens {
+            let e = self.step_explained(top_k)?;
+            out.push(e.token);
+            on_token(self, &e)?;
+            if stop.contains(&e.token) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn model(&self) -> &'m Model {
+        self.model
     }
 
     pub fn history(&self) -> &[u32] {

@@ -1,4 +1,6 @@
+use defer::attribution::{self, Explanation, PositionScore};
 use defer::checkpoint::DeferCheckpoint;
+use defer::json;
 use defer::engine::{seed_from_u64, Session};
 use defer::error::{DeferError, Result};
 use defer::model::Model;
@@ -18,6 +20,7 @@ USAGE:
   defer checkout --model <file.safetensors> --from <file.ckpt|file.wal> [options]
   defer verify --model <file.safetensors> --prompt <text> [--runs N] [options]
   defer inspect <file.ckpt|file.wal>
+  defer explain --model <file.safetensors> --from <file.ckpt|file.wal> [options]
   defer make-test-model --out <file.safetensors> [--seed N]
 
 GENERATION OPTIONS:
@@ -32,6 +35,19 @@ GENERATION OPTIONS:
   --durable              fsync the WAL after every token
   --checkpoint <file>    write a checkpoint when generation finishes
   --quiet                only print generated text
+
+ATTRIBUTION (run / checkout):
+  --explain              print the top context positions behind each token (stderr)
+  --explain-top <k>      positions per token                     [default: 3]
+  --explain-jsonl <file> write per-token attributions as JSON lines
+
+EXPLAIN OPTIONS:
+  --step <n>             history index of the token to explain; negative counts
+                         from the end                            [default: -1]
+  --method <m>           attention | ablation | both             [default: attention]
+  --window <w>           only ablate the last w positions before the query
+  --top <k>              rows to show                            [default: 10]
+  --json                 machine-readable output
 ";
 
 struct Args {
@@ -40,7 +56,7 @@ struct Args {
     positional: Vec<String>,
 }
 
-const BOOL_FLAGS: &[&str] = &["no-bos", "ignore-eos", "durable", "quiet", "help"];
+const BOOL_FLAGS: &[&str] = &["no-bos", "ignore-eos", "durable", "quiet", "help", "explain", "json"];
 
 impl Args {
     fn parse() -> Result<Args> {
@@ -103,6 +119,7 @@ fn main() {
             "checkout" => cmd_checkout(&args),
             "verify" => cmd_verify(&args),
             "inspect" => cmd_inspect(&args),
+            "explain" => cmd_explain(&args),
             "make-test-model" => cmd_make_test_model(&args),
             other => Err(DeferError::Parse(format!("unknown command `{other}` (see --help)"))),
         }
@@ -242,15 +259,46 @@ fn run_generation(
     let quiet = args.has("quiet");
     let mut streamer = Streamer::new();
     let t = Instant::now();
-    let generated = session.generate(max_tokens, stop, |s, token| {
-        if let Some(w) = wal.as_mut() {
-            w.append(token, s.rng_word_pos())?;
-        }
-        if !tok.is_special(token) {
-            streamer.push(&tok.token_bytes(token));
-        }
-        Ok(())
-    })?;
+    let explain = args.has("explain") || args.has("explain-jsonl");
+    let generated = if explain {
+        // Explanation lines go to stderr; the text is printed once at the
+        // end so the two streams do not interleave on a terminal.
+        let top: usize = args.num("explain-top", 3)?;
+        let mut jsonl = match args.get("explain-jsonl") {
+            Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+            None => None,
+        };
+        let mut text = Vec::new();
+        session.enable_tracing();
+        let out = session.generate_explained(max_tokens, stop, top, |s, e| {
+            if let Some(w) = wal.as_mut() {
+                w.append(e.token, s.rng_word_pos())?;
+            }
+            if !tok.is_special(e.token) {
+                text.extend(tok.token_bytes(e.token));
+            }
+            if args.has("explain") {
+                eprintln!("{}", explanation_line(tok, e));
+            }
+            if let Some(w) = jsonl.as_mut() {
+                writeln!(w, "{}", explanation_json(tok, e))?;
+                w.flush()?;
+            }
+            Ok(())
+        })?;
+        streamer.push(&text);
+        out
+    } else {
+        session.generate(max_tokens, stop, |s, token| {
+            if let Some(w) = wal.as_mut() {
+                w.append(token, s.rng_word_pos())?;
+            }
+            if !tok.is_special(token) {
+                streamer.push(&tok.token_bytes(token));
+            }
+            Ok(())
+        })?
+    };
     streamer.finish();
     let dt = t.elapsed();
     if !quiet {
@@ -270,6 +318,203 @@ fn run_generation(
         if !quiet {
             eprintln!("[defer] checkpoint written to {p} ({} bytes)", ck.to_bytes().len());
         }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------ attribution
+
+/// Debug-quoted text of one token, e.g. `" Paris"` or `"\n"`.
+fn tok_text(tok: &Tokenizer, id: u32) -> String {
+    format!("{:?}", String::from_utf8_lossy(&tok.token_bytes(id)))
+}
+
+fn json_num(x: f64) -> String {
+    if x.is_finite() {
+        format!("{x}")
+    } else {
+        "null".into()
+    }
+}
+
+fn explanation_line(tok: &Tokenizer, e: &Explanation) -> String {
+    let parts: Vec<String> = e
+        .top
+        .iter()
+        .map(|s| format!("{} {} {:.3}", s.position, tok_text(tok, s.token), s.attn_value))
+        .collect();
+    format!(
+        "[explain] #{} {} (p={:.3}) <- {}",
+        e.position,
+        tok_text(tok, e.token),
+        e.logprob.exp(),
+        parts.join(" | ")
+    )
+}
+
+fn position_json(tok: &Tokenizer, s: &PositionScore, ablation: Option<f64>) -> String {
+    let mut j = format!(
+        "{{\"position\":{},\"token\":{},\"text\":{},\"attention\":{},\"attn_value\":{}",
+        s.position,
+        s.token,
+        json::quote(&String::from_utf8_lossy(&tok.token_bytes(s.token))),
+        json_num(s.attention as f64),
+        json_num(s.attn_value as f64)
+    );
+    if let Some(d) = ablation {
+        j.push_str(&format!(",\"ablation_delta\":{}", json_num(d)));
+    }
+    j.push('}');
+    j
+}
+
+fn explanation_json(tok: &Tokenizer, e: &Explanation) -> String {
+    let top: Vec<String> = e.top.iter().map(|s| position_json(tok, s, None)).collect();
+    format!(
+        "{{\"position\":{},\"token\":{},\"text\":{},\"logprob\":{},\"top\":[{}]}}",
+        e.position,
+        e.token,
+        json::quote(&String::from_utf8_lossy(&tok.token_bytes(e.token))),
+        json_num(e.logprob),
+        top.join(",")
+    )
+}
+
+/// `defer explain`: offline attribution for any token of a WAL/checkpoint.
+fn cmd_explain(args: &Args) -> Result<()> {
+    let from = PathBuf::from(args.req("from")?);
+    let ckpt = match read_source(&from)? {
+        Source::Checkpoint(c) => c,
+        Source::Wal(log) => log.to_checkpoint(),
+    };
+    let model = load_model(args)?;
+    if ckpt.model_signature != model.signature {
+        return Err(DeferError::Checkpoint(format!(
+            "model signature mismatch: {} was recorded with {}",
+            from.display(),
+            to_hex(&ckpt.model_signature)
+        )));
+    }
+    let tok = load_tokenizer(args, &model)?;
+    let hist = &ckpt.history_tokens;
+    let n = hist.len() as i64;
+    let step: i64 = args.num("step", n - 1)?;
+    let step = if step < 0 { n + step } else { step };
+    if step < 1 || step >= n {
+        return Err(DeferError::Parse(format!("--step must be in 1..{} (or negative from the end)", n - 1)));
+    }
+    let step = step as usize;
+    let method = args.get("method").unwrap_or("attention");
+    let (use_attn, use_abl) = match method {
+        "attention" => (true, false),
+        "ablation" => (false, true),
+        "both" => (true, true),
+        m => return Err(DeferError::Parse(format!("unknown --method {m} (attention|ablation|both)"))),
+    };
+    let top: usize = args.num("top", 10)?;
+    let context = &hist[..step];
+    let target = hist[step];
+    let quiet = args.has("quiet");
+
+    let t = Instant::now();
+    let (attn, logits) = attribution::attention_for_context(&model, context)?;
+    let logprob = attribution::log_softmax_at(&logits, target as usize);
+
+    let mut ablation: Vec<Option<f64>> = vec![None; context.len()];
+    if use_abl {
+        let window: usize = args.num("window", context.len())?;
+        let last = context.len() - 1; // the query token can not be hidden from itself
+        let positions: Vec<usize> = (last.saturating_sub(window)..last).collect();
+        if !quiet {
+            eprintln!("[defer] ablating {} positions...", positions.len());
+        }
+        let rep = attribution::ablation_attribution(&model, context, target, &positions)?;
+        for s in &rep.scores {
+            ablation[s.position] = Some(s.delta);
+        }
+    }
+    if !quiet {
+        eprintln!("[defer] attribution computed in {:.2?}", t.elapsed());
+    }
+
+    // Rank: ablation delta if available, else attention x value.
+    let mut rows: Vec<(PositionScore, Option<f64>)> =
+        attn.into_iter().map(|s| { let a = ablation[s.position]; (s, a) }).collect();
+    if use_abl {
+        if !use_attn {
+            rows.retain(|(_, a)| a.is_some());
+        }
+        attribution::rank_by(&mut rows, |(_, a)| a.unwrap_or(f64::NEG_INFINITY), |(s, _)| s.position);
+    } else {
+        attribution::rank_by(&mut rows, |(s, _)| s.attn_value as f64, |(s, _)| s.position);
+    }
+    rows.truncate(top);
+
+    let generated = step >= ckpt.prompt_len as usize;
+    if args.has("json") {
+        let items: Vec<String> = rows
+            .iter()
+            .map(|(s, a)| position_json(&tok, s, if use_abl { Some(a.unwrap_or(f64::NAN)) } else { None }))
+            .collect();
+        println!(
+            "{{\"position\":{},\"token\":{},\"text\":{},\"generated\":{},\"logprob\":{},\"method\":{},\"positions\":[{}]}}",
+            step,
+            target,
+            json::quote(&String::from_utf8_lossy(&tok.token_bytes(target))),
+            generated,
+            json_num(logprob),
+            json::quote(method),
+            items.join(",")
+        );
+        return Ok(());
+    }
+
+    println!(
+        "explaining position {step}: {} ({}, logprob {:.4}, p={:.4})",
+        tok_text(&tok, target),
+        if generated { "generated" } else { "prompt" },
+        logprob,
+        logprob.exp()
+    );
+    // Context with the top positions highlighted.
+    let marked: Vec<usize> = rows
+        .iter()
+        .filter(|(s, a)| if use_abl { a.map_or(false, |d| d > 0.0) } else { s.attn_value > 0.0 })
+        .map(|(s, _)| s.position)
+        .collect();
+    let mut ctx = Vec::new();
+    for (i, &id) in context.iter().enumerate() {
+        let hl = marked.contains(&i);
+        if hl {
+            ctx.extend_from_slice("⟦".as_bytes());
+        }
+        ctx.extend(tok.token_bytes(id));
+        if hl {
+            ctx.extend_from_slice("⟧".as_bytes());
+        }
+    }
+    println!("context: {}\u{2192} {}\n", String::from_utf8_lossy(&ctx), tok_text(&tok, target));
+    print!("{:>4}  {:>5}  {:<20}  {:>10}  {:>9}", "rank", "pos", "token", "attn×value", "attention");
+    if use_abl {
+        print!("  {:>9}", "Δlogprob");
+    }
+    println!();
+    for (r, (s, a)) in rows.iter().enumerate() {
+        let mut text = tok_text(&tok, s.token);
+        if text.chars().count() > 20 {
+            text = text.chars().take(19).collect::<String>() + "…";
+        }
+        print!("{:>4}  {:>5}  {:<20}  {:>10.4}  {:>9.4}", r + 1, s.position, text, s.attn_value, s.attention);
+        if use_abl {
+            match a {
+                Some(d) => print!("  {:>+9.4}", d),
+                None => print!("  {:>9}", "-"),
+            }
+        }
+        println!();
+    }
+    if use_abl {
+        println!("\nΔlogprob > 0: hiding the position lowers p(target), so it supported this token.");
     }
     Ok(())
 }

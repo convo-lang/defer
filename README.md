@@ -179,7 +179,8 @@ All six phases are implemented. Module map:
 | 3 | `src/sampler.rs` | Temperature, softmax, single-pass CDF. Exactly one ChaCha8 word per sampled token, none for greedy. Ties go to the lowest index, NaN is treated as `-inf` |
 | 4 | `src/safetensors.rs`, `src/tokenizer.rs`, `src/json.rs` | Single-pass sequential safetensors reader (F32/F16/BF16/F64) that hashes the file (SHA-256 = model signature) while it reads; BPE tokenizer from `tokenizer.json` (byte-level and SentencePiece/byte-fallback), plus a raw-byte fallback |
 | 5 | `src/wal.rs`, `src/checkpoint.rs`, `src/engine.rs` | CRC-protected WAL that survives torn tails, `DeferCheckpoint` binary format, `Session::checkout` Checkout Engine |
-| 6 | `tests/verification.rs` | 100-run zero-deviation test; bit-level checkout-vs-fresh KV cache test; resume, WAL-crash and tamper tests |
+| + | `src/attribution.rs` | Token attribution: live attention × value-norm scores, plus offline leave-one-out ablation (see *Token Attribution* below) |
+| 6 | `tests/verification.rs`, `tests/attribution.rs` | 100-run zero-deviation test; bit-level checkout-vs-fresh KV cache test; resume, WAL-crash and tamper tests |
 
 The only dependencies are `rand` and `rand_chacha`. JSON, SHA-256, CRC-32 and f16/bf16 conversion are implemented in-crate.
 
@@ -220,5 +221,42 @@ cargo run --release -- verify --model path/to/model.safetensors --prompt "Hello"
 ```
 
 Run `defer --help` for every option (`--seed-hex`, `--durable` fsync-per-token WAL, `--no-bos`, `--ignore-eos`, `--tokenizer`, `--quiet`).
+
+### Token Attribution
+
+You can ask which context positions were most responsible for a generated token. There are two methods:
+
+| Method | Cost | What it measures |
+|---|---|---|
+| `attention` (attention × value norm) | about 4% overhead, runs live | For the query that produced the logits, each layer/head's attention to position *t* is scaled by ‖W_o,h·v_t‖ (how much *t* actually writes into the residual stream), normalised per head, then averaged. Plain mean attention is reported too. |
+| `ablation` (leave-one-out) | one partial replay per position, offline | Hides position *t* from every later query in every layer, keeps the RoPE positions unchanged, recomputes, and reports Δ = log p(target) − log p(target \| *t* hidden). This is the causal answer. |
+
+```bash
+# Live: top-3 positions behind each generated token (stderr), plus JSON lines
+defer --model M --prompt "The capital of France is" --temperature 0 --max-tokens 8 \
+      --explain --explain-jsonl attr.jsonl --wal fr.wal
+
+# Offline, for any recorded token (negative --step counts from the end)
+defer explain --model M --from fr.wal --step 6 --method ablation
+```
+
+```
+explaining position 6: " capital" (generated, logprob -2.4369, p=0.0874)
+context: The⟦ capital⟧⟦ of⟧⟦ France⟧ is the→ " capital"
+
+rank    pos  token                 attn×value  attention   Δlogprob
+   1      1  " capital"                0.0973     0.0455    +2.1009
+   2      3  " France"                 0.1010     0.0518    +1.7136
+   3      2  " of"                     0.0586     0.0350    +1.5811
+   4      0  "The"                     0.3518     0.5165    -0.1960
+```
+
+The example shows why both methods exist. Attention-based scores are dominated by the first token, an "attention sink" the model parks attention on. Ablation shows that token is not actually driving the prediction. Use `--method both` to compare them side by side, `--window W` to limit the cost of ablation, and `--json` for tooling.
+
+Determinism guarantees:
+
+* Tracing only copies values out of the forward pass. A session with `--explain` produces the same tokens, logits, KV cache bits and PRNG position as one without it, and its WAL replays identically.
+* With an empty mask, the masked forward pass is arithmetically identical to the normal one. Ablation's prefix reuse is bit-identical to a full masked recompute, and the tests check this.
+* Live and offline attributions for the same token are bit-identical. Since the engine is deterministic, every non-zero ablation delta comes from the ablation itself and never from run-to-run noise.
 
 The WAL and checkpoint binary layouts are documented at the top of `src/wal.rs` and `src/checkpoint.rs`.

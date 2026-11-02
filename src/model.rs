@@ -242,6 +242,32 @@ impl KvCache {
     }
 }
 
+/// Post-softmax attention probabilities of a single query position.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AttnTrace {
+    /// Position of the query token.
+    pub pos: usize,
+    pub num_heads: usize,
+    /// `probs[layer][head * (pos + 1) + t]`: attention from the query to `t`.
+    pub probs: Vec<Vec<f32>>,
+}
+
+impl AttnTrace {
+    fn reset(&mut self, pos: usize, num_layers: usize, num_heads: usize) {
+        self.pos = pos;
+        self.num_heads = num_heads;
+        self.probs.resize(num_layers, Vec::new());
+        for p in self.probs.iter_mut() {
+            p.clear();
+        }
+    }
+
+    /// Attention of `head` in `layer` to key position `t`.
+    pub fn at(&self, layer: usize, head: usize, t: usize) -> f32 {
+        self.probs[layer][head * (self.pos + 1) + t]
+    }
+}
+
 pub struct Model {
     pub config: Config,
     /// SHA-256 of the weights file.
@@ -336,6 +362,11 @@ impl Model {
         })
     }
 
+    /// Attention output projection `[hidden, q_dim]` of layer `l`.
+    pub fn attn_output_weight(&self, l: usize) -> &Tensor {
+        &self.layers[l].wo
+    }
+
     pub fn new_cache(&self) -> KvCache {
         KvCache::new(&self.config)
     }
@@ -343,8 +374,46 @@ impl Model {
     /// Run one token through the network at position `cache.len()`,
     /// appending its keys/values to the cache. Returns next-token logits.
     pub fn forward(&self, token: u32, cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.forward_ext(token, cache, &[], None)
+    }
+
+    /// Like [`Model::forward`], additionally recording the post-softmax
+    /// attention probabilities of this query into `trace`.
+    pub fn forward_traced(&self, token: u32, cache: &mut KvCache, trace: &mut AttnTrace) -> Result<Vec<f32>> {
+        self.forward_ext(token, cache, &[], Some(trace))
+    }
+
+    /// Full-control forward pass.
+    ///
+    /// * `masked`: earlier positions this query may not attend to, in any
+    ///   layer or head (their attention logit is forced to `-inf`). Used for
+    ///   ablation. A query always sees itself; masks `>= cache.len()` are
+    ///   ignored. With an empty mask the arithmetic is identical to
+    ///   [`Model::forward`].
+    /// * `trace`: if given, receives this query's attention probabilities.
+    pub fn forward_ext(
+        &self,
+        token: u32,
+        cache: &mut KvCache,
+        masked: &[usize],
+        mut trace: Option<&mut AttnTrace>,
+    ) -> Result<Vec<f32>> {
         let c = &self.config;
         let pos = cache.len();
+        let skip: Vec<bool> = if masked.is_empty() {
+            Vec::new()
+        } else {
+            let mut s = vec![false; pos + 1];
+            for &m in masked {
+                if m < pos {
+                    s[m] = true;
+                }
+            }
+            s
+        };
+        if let Some(tr) = trace.as_deref_mut() {
+            tr.reset(pos, c.num_layers, c.num_heads);
+        }
         if token as usize >= c.vocab_size {
             return Err(DeferError::Model(format!("token id {token} out of range")));
         }
@@ -406,7 +475,17 @@ impl Model {
                     let kt = &keys[t * kv_dim + kvh * hd..t * kv_dim + (kvh + 1) * hd];
                     scores[t] = ops::dot(qh, kt) * scale;
                 }
+                if !skip.is_empty() {
+                    for t in 0..pos {
+                        if skip[t] {
+                            scores[t] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
                 ops::softmax_inplace(&mut scores);
+                if let Some(tr) = trace.as_deref_mut() {
+                    tr.probs[l].extend_from_slice(&scores);
+                }
                 let out = &mut att_out[h * hd..(h + 1) * hd];
                 for d in 0..hd {
                     let mut acc = 0.0f32;

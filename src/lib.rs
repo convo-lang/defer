@@ -21,6 +21,7 @@
 //! 5. `HashMap`s are only ever used for lookups, never iterated to produce
 //!    output, so their randomised ordering can not leak into results.
 
+pub mod attribution;
 pub mod checkpoint;
 pub mod crc32;
 pub mod engine;
